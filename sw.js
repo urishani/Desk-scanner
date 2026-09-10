@@ -1,4 +1,4 @@
-const CACHE = "desk-scanner-v2";
+const CACHE = "desk-scanner-v3";
 const APP = ["./", "./index.html", "./manifest.webmanifest"];
 
 self.addEventListener("install", event => {

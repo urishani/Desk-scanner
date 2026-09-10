@@ -61,7 +61,7 @@
 <header>
   <div class="brand">
     <h1>Desk Scanner</h1>
-    <span id="appVersion" class="ver"><!--APP_VERSION-->v2<!--/APP_VERSION--></span>
+    <span id="appVersion" class="ver"><!--APP_VERSION-->v3<!--/APP_VERSION--></span>
   </div>
 </header>
 
@@ -292,24 +292,52 @@ function detectFromVideo(){
   return p.map(pt=>({x:pt.x/scale,y:pt.y/scale}));
 }
 
+async function setTorch(on){
+  const track=stream&&stream.getVideoTracks()[0];
+  if(!track) return false;
+  const caps=track.getCapabilities?track.getCapabilities():{};
+  if(!caps.torch) return false;
+  try{
+    await track.applyConstraints({advanced:[{torch:!!on}]});
+    return true;
+  }catch(e){
+    try{
+      await track.applyConstraints({torch:!!on});
+      return true;
+    }catch(e2){
+      return false;
+    }
+  }
+}
+
 async function grabCaptureBitmap(){
   const track=stream&&stream.getVideoTracks()[0];
-  if(track && 'ImageCapture' in window){
-    try{
-      const ic=new ImageCapture(track);
-      let opts;
+  let torchOn=false;
+  try{
+    torchOn=await setTorch(true);
+    if(torchOn) await new Promise(r=>setTimeout(r,200));
+    if(track && 'ImageCapture' in window){
       try{
-        const caps=await ic.getPhotoCapabilities();
-        if(caps.imageWidth&&caps.imageWidth.max&&caps.imageHeight&&caps.imageHeight.max){
-          opts={imageWidth:caps.imageWidth.max,imageHeight:caps.imageHeight.max};
-        }
+        const ic=new ImageCapture(track);
+        const opts={};
+        try{
+          const caps=await ic.getPhotoCapabilities();
+          if(caps.imageWidth&&caps.imageWidth.max) opts.imageWidth=caps.imageWidth.max;
+          if(caps.imageHeight&&caps.imageHeight.max) opts.imageHeight=caps.imageHeight.max;
+          const modes=caps.fillLightMode;
+          const list=modes&&typeof modes.includes==='function'?modes:Array.isArray(modes)?modes:[];
+          if(list.includes('flash')) opts.fillLightMode='flash';
+          else if(list.includes('auto')) opts.fillLightMode='auto';
+        }catch(e){}
+        let blob;
+        try{blob=await ic.takePhoto(Object.keys(opts).length?opts:undefined);}catch(e){blob=await ic.takePhoto();}
+        return await createImageBitmap(blob);
       }catch(e){}
-      let blob;
-      try{blob=await ic.takePhoto(opts);}catch(e){blob=await ic.takePhoto();}
-      return await createImageBitmap(blob);
-    }catch(e){}
+    }
+    return await createImageBitmap(video);
+  }finally{
+    if(torchOn) await setTorch(false);
   }
-  return await createImageBitmap(video);
 }
 
 function enterReview(){
@@ -341,7 +369,7 @@ async function captureFrame(mode){
   if(!video.videoWidth)return;
   captureMode=mode;
   enterReview();
-  status(mode==='document' ? 'Capturing document…' : 'Capturing picture…');
+  status(mode==='document' ? 'Capturing document with flash…' : 'Capturing picture with flash…');
   try{
     const bmp=await grabCaptureBitmap();
     source.width=bmp.width;source.height=bmp.height;
@@ -452,37 +480,6 @@ function warp(mat,p){
   return out;
 }
 
-function histPercentile(gray,p){
-  const maxSide=360;
-  let src=gray, small=null;
-  if(Math.max(gray.cols,gray.rows)>maxSide){
-    const s=maxSide/Math.max(gray.cols,gray.rows);
-    small=new cv.Mat();
-    cv.resize(gray,small,new cv.Size(Math.max(1,Math.round(gray.cols*s)),Math.max(1,Math.round(gray.rows*s))),0,0,cv.INTER_AREA);
-    src=small;
-  }
-  try{
-    const vec=new cv.MatVector();
-    vec.push_back(src);
-    const hist=new cv.Mat(), mask=new cv.Mat();
-    cv.calcHist(vec,[0],mask,hist,[256],[0,256],false);
-    const want=src.rows*src.cols*p;
-    let acc=0, bin=255;
-    const data=hist.data32F;
-    for(let i=0;i<256;i++){
-      acc+=data[i];
-      if(acc>=want){bin=i;break;}
-    }
-    vec.delete();hist.delete();mask.delete();
-    if(small) small.delete();
-    return bin;
-  }catch(e){
-    const mean=cv.mean(src)[0];
-    if(small) small.delete();
-    return Math.max(0,Math.min(255,Math.round(mean)));
-  }
-}
-
 function estimateBackground(L){
   const maxSide=480;
   const s=Math.min(1,maxSide/Math.max(L.cols,L.rows));
@@ -499,23 +496,9 @@ function estimateBackground(L){
   return bg;
 }
 
-function makeWhiteLut(t0,t1){
-  const lut=new cv.Mat(1,256,cv.CV_8UC1);
-  const d=lut.data;
-  const span=Math.max(1,t1-t0);
-  for(let i=0;i<256;i++){
-    let m=(i-t0)/span;
-    if(m<0)m=0; if(m>1)m=1;
-    m=m*m*(3-2*m);
-    d[i]=Math.round(i+m*(255-i));
-  }
-  return lut;
-}
-
 function enhanceDocument(src){
   const rgb=new cv.Mat();
   cv.cvtColor(src,rgb,src.channels()===4?cv.COLOR_RGBA2RGB:cv.COLOR_GRAY2RGB);
-
   const lab=new cv.Mat();
   cv.cvtColor(rgb,lab,cv.COLOR_RGB2Lab);
   const planes=new cv.MatVector();
@@ -523,52 +506,33 @@ function enhanceDocument(src){
   const L=planes.get(0), A=planes.get(1), Bch=planes.get(2);
 
   const bg=estimateBackground(L);
-  const Lf=new cv.Mat(), bf=new cv.Mat();
-  L.convertTo(Lf,cv.CV_32F);
-  bg.convertTo(bf,cv.CV_32F,1,8);
-  cv.divide(Lf,bf,Lf);
-  const Lflat=new cv.Mat();
-  Lf.convertTo(Lflat,cv.CV_8U,245,0);
+  const Llift=new cv.Mat(), near=new cv.Mat();
+  L.convertTo(Llift,-1,1,12);
+  cv.compare(Llift,bg,near,cv.CMP_GE);
 
-  const lo=histPercentile(Lflat,0.02);
-  const hi=Math.max(lo+8,histPercentile(Lflat,0.98));
-  const alpha=235/Math.max(1,hi-lo);
-  const beta=-lo*alpha+12;
-  Lflat.convertTo(Lflat,-1,alpha,beta);
+  const diff=new cv.Mat(), close=new cv.Mat();
+  cv.absdiff(L,bg,diff);
+  cv.threshold(diff,close,14,255,cv.THRESH_BINARY_INV);
 
-  const clahe=new cv.CLAHE(1.6,new cv.Size(8,8));
-  const Leq=new cv.Mat();
-  clahe.apply(Lflat,Leq);
-  clahe.delete();
+  const blur=new cv.Mat(), edge=new cv.Mat(), flat=new cv.Mat();
+  cv.GaussianBlur(L,blur,new cv.Size(3,3),0);
+  cv.absdiff(L,blur,edge);
+  cv.threshold(edge,flat,11,255,cv.THRESH_BINARY_INV);
 
-  const paper=Math.max(200,histPercentile(Leq,0.90));
-  const t0=Math.max(168,Math.round(paper*0.84));
-  const t1=Math.min(252,paper+4);
-  const lut=makeWhiteLut(t0,t1);
-  const Lout=new cv.Mat();
-  cv.LUT(Leq,lut,Lout);
+  const paper=new cv.Mat();
+  cv.bitwise_and(near,close,paper);
+  cv.bitwise_and(paper,flat,paper);
+  const k=cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(3,3));
+  cv.erode(paper,paper,k);
 
-  const paperMask=new cv.Mat();
-  cv.threshold(Lout,paperMask,Math.round((t0+t1)/2),255,cv.THRESH_BINARY);
-  A.setTo(new cv.Scalar(128),paperMask);
-  Bch.setTo(new cv.Scalar(128),paperMask);
-
-  const Lsharp=new cv.Mat(), Lblur=new cv.Mat();
-  cv.GaussianBlur(Lout,Lblur,new cv.Size(0,0),0.7);
-  cv.addWeighted(Lout,1.75,Lblur,-0.75,0,Lsharp);
-
-  const merged=new cv.Mat(), outPlanes=new cv.MatVector();
-  outPlanes.push_back(Lsharp);outPlanes.push_back(A);outPlanes.push_back(Bch);
-  cv.merge(outPlanes,merged);
-  const color=new cv.Mat();
-  cv.cvtColor(merged,color,cv.COLOR_Lab2RGB);
+  const out=rgb.clone();
+  out.setTo(new cv.Scalar(255,255,255),paper);
   const rgba=new cv.Mat();
-  cv.cvtColor(color,rgba,cv.COLOR_RGB2RGBA);
+  cv.cvtColor(out,rgba,cv.COLOR_RGB2RGBA);
 
   rgb.delete();lab.delete();planes.delete();L.delete();A.delete();Bch.delete();
-  bg.delete();Lf.delete();bf.delete();Lflat.delete();Leq.delete();lut.delete();
-  Lout.delete();paperMask.delete();Lsharp.delete();Lblur.delete();
-  merged.delete();outPlanes.delete();color.delete();
+  bg.delete();Llift.delete();near.delete();diff.delete();close.delete();
+  blur.delete();edge.delete();flat.delete();paper.delete();k.delete();out.delete();
   return rgba;
 }
 
@@ -621,7 +585,7 @@ function processPage(){
     return;
   }
   status(captureMode==='document'
-    ? 'Flattening the page, whitening the background, and sharpening text…'
+    ? 'Whitening the paper, leaving text unchanged…'
     : 'Correcting perspective and enhancing the photo…');
   setTimeout(()=>{
     const mat=cv.imread(captured);
