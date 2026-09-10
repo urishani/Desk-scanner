@@ -11,22 +11,30 @@
 <link rel="manifest" href="manifest.webmanifest">
 <style>
   *{box-sizing:border-box}
-  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#111;color:#eee}
-  header{padding:14px 18px;background:#1b1b1b;display:flex;align-items:center;justify-content:space-between;gap:12px}
-  h1{font-size:20px;margin:0}.sub{font-size:12px;color:#aaa}
-  main{max-width:1100px;margin:auto;padding:14px}
-  .card{background:#1b1b1b;border-radius:14px;padding:12px;margin-bottom:14px}
-  .camera{position:relative;background:#000;border-radius:10px;overflow:hidden;min-height:280px}
-  video{display:block;width:100%;max-height:68vh;object-fit:contain;background:#000}
+  html,body{height:100%;margin:0}
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#111;color:#eee;display:flex;flex-direction:column;min-height:100dvh}
+  body.live{overflow:hidden;height:100dvh}
+  header{padding:8px 14px;padding-top:max(8px,env(safe-area-inset-top));background:#1b1b1b;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-shrink:0}
+  h1{font-size:17px;margin:0}.sub{font-size:12px;color:#aaa;display:none}
+  @media (min-width:800px){.sub{display:block}h1{font-size:20px}header{padding:14px 18px}}
+  main{flex:1;display:flex;flex-direction:column;min-height:0;max-width:1100px;width:100%;margin:auto;padding:0}
+  body.live main{max-width:none;overflow:hidden}
+  .card{background:#1b1b1b;border-radius:14px;padding:12px;margin:14px}
+  #scanCard{flex:1;display:flex;flex-direction:column;min-height:0;margin:0;border-radius:0;padding:0;background:#000}
+  .camera{position:relative;background:#000;flex:1;min-height:0;overflow:hidden}
+  video{display:block;width:100%;height:100%;object-fit:contain;background:#000}
   #overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
-  .controls{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+  .camera-ui{position:absolute;left:0;right:0;bottom:0;padding:10px 12px max(12px,env(safe-area-inset-bottom));background:linear-gradient(transparent,rgba(0,0,0,.82) 36%)}
+  .controls{display:flex;flex-wrap:wrap;gap:8px}
   button,select,input{font:inherit}
   button{border:0;border-radius:9px;padding:10px 14px;background:#333;color:white;cursor:pointer}
   button.primary{background:#087f5b}.warn{background:#8a5b00}.danger{background:#8b3030}
   button:disabled{opacity:.45;cursor:not-allowed}
+  #capture{padding:12px 18px;font-weight:650}
   label{display:flex;align-items:center;gap:7px;background:#252525;border-radius:9px;padding:8px 10px;font-size:14px}
   input[type=range]{width:130px}
   .status{font-size:13px;color:#bbb;margin-top:8px;min-height:18px}
+  #status{text-shadow:0 1px 2px #000}
   #resultWrap{display:none}.result{display:flex;justify-content:center;background:#282828;padding:10px;border-radius:10px}
   #resultCanvas{max-width:100%;height:auto;max-height:75vh;background:white}
   .thumbs{display:flex;gap:8px;overflow:auto;margin-top:10px}
@@ -43,20 +51,22 @@
 </header>
 
 <main>
-<section class="card">
+<section id="scanCard" class="card">
   <div class="camera">
     <video id="video" autoplay playsinline muted></video>
     <canvas id="overlay"></canvas>
+    <div class="camera-ui">
+      <div class="controls">
+        <button id="start" class="primary">Start camera</button>
+        <button id="capture" class="primary" disabled>Capture page</button>
+        <button id="stop" disabled>Stop camera</button>
+        <label>Detection
+          <select id="detectMode"><option value="auto">Automatic</option><option value="manual">Manual corners</option></select>
+        </label>
+      </div>
+      <div id="status" class="status">Press “Start camera”. On Android, Chrome will request camera permission. The app will use the highest-resolution rear camera and outline the page automatically.</div>
+    </div>
   </div>
-  <div class="controls">
-    <button id="start" class="primary">Start camera</button>
-    <button id="capture" class="primary" disabled>Capture page</button>
-    <button id="stop" disabled>Stop camera</button>
-    <label>Detection
-      <select id="detectMode"><option value="auto">Automatic</option><option value="manual">Manual corners</option></select>
-    </label>
-  </div>
-  <div id="status" class="status">Press “Start camera”. On Android, Chrome will request camera permission. Use the rear camera and keep all four page edges visible.</div>
 </section>
 
 <section id="editCard" class="card" style="display:none">
@@ -93,24 +103,110 @@
 </section>
 
 <canvas id="sourceCanvas" class="hidden"></canvas>
+<canvas id="detectCanvas" class="hidden"></canvas>
 </main>
 
 <script src="https://docs.opencv.org/4.x/opencv.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script>
 const $=id=>document.getElementById(id);
-const video=$('video'), overlay=$('overlay'), source=$('sourceCanvas'), result=$('resultCanvas');
+const video=$('video'), overlay=$('overlay'), source=$('sourceCanvas'), result=$('resultCanvas'), detectCanvas=$('detectCanvas');
+const DEVICE_KEY='deskScanner.deviceId';
 let stream=null, cvReady=false, captured=null, pages=[];
-let corners=null;
+let corners=null, liveCorners=null, detectTimer=0, detectBusy=false;
 
 function status(t){$('status').textContent=t}
 function editStatus(t){$('editStatus').textContent=t}
 
 function waitForCV(){
-  if(typeof cv!=='undefined' && cv.Mat){cvReady=true; status('OpenCV is ready. Start the camera when you are ready.');}
-  else setTimeout(waitForCV,150);
+  if(typeof cv!=='undefined' && cv.Mat){
+    cvReady=true;
+    if(stream) startDetectLoop();
+    else status('OpenCV is ready. Start the camera when you are ready.');
+  } else setTimeout(waitForCV,150);
 }
 waitForCV();
+
+function isRearCamera(label){
+  return /back|rear|environment|facing back/i.test(label||'');
+}
+function isSecondaryLens(label){
+  return /ultra|telephoto|\btele\b|depth|macro|tof|infrared|ir camera/i.test(label||'');
+}
+
+async function unlockCameraPermission(){
+  const tmp=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});
+  tmp.getTracks().forEach(t=>t.stop());
+}
+
+async function listCandidateCameras(){
+  const devices=await navigator.mediaDevices.enumerateDevices();
+  const videos=devices.filter(d=>d.kind==='videoinput');
+  const rear=videos.filter(d=>isRearCamera(d.label));
+  const pool=rear.length?rear:videos;
+  const main=pool.filter(d=>!isSecondaryLens(d.label));
+  return main.length?main:pool;
+}
+
+async function openCamera(deviceId){
+  const videoConstraints={
+    width:{ideal:7680},
+    height:{ideal:4320}
+  };
+  if(deviceId) videoConstraints.deviceId={exact:deviceId};
+  else videoConstraints.facingMode={ideal:'environment'};
+  const s=await navigator.mediaDevices.getUserMedia({video:videoConstraints,audio:false});
+  const track=s.getVideoTracks()[0];
+  await maximizeTrack(track);
+  return s;
+}
+
+async function maximizeTrack(track){
+  const caps=track.getCapabilities?track.getCapabilities():{};
+  const cons={};
+  if(caps.width&&caps.width.max) cons.width={ideal:caps.width.max};
+  if(caps.height&&caps.height.max) cons.height={ideal:caps.height.max};
+  if(caps.resizeMode&&caps.resizeMode.includes('none')) cons.resizeMode='none';
+  if(caps.focusMode&&caps.focusMode.includes('continuous')) cons.focusMode='continuous';
+  if(Object.keys(cons).length){
+    try{await track.applyConstraints(cons);}catch(e){}
+  }
+}
+
+function trackPixels(track){
+  const caps=track.getCapabilities?track.getCapabilities():{};
+  const settings=track.getSettings();
+  const w=caps.width&&caps.width.max?caps.width.max:(settings.width||0);
+  const h=caps.height&&caps.height.max?caps.height.max:(settings.height||0);
+  return w*h;
+}
+
+async function pickHighestResStream(candidates){
+  const cached=localStorage.getItem(DEVICE_KEY);
+  if(cached&&candidates.some(d=>d.deviceId===cached)){
+    try{return await openCamera(cached);}catch(e){localStorage.removeItem(DEVICE_KEY);}
+  }
+  if(candidates.length<=1){
+    const s=await openCamera(candidates[0]?candidates[0].deviceId:null);
+    const id=s.getVideoTracks()[0].getSettings().deviceId;
+    if(id) localStorage.setItem(DEVICE_KEY,id);
+    return s;
+  }
+  let best=null, bestPixels=-1, bestId=null;
+  for(const dev of candidates){
+    try{
+      const s=await openCamera(dev.deviceId);
+      const pixels=trackPixels(s.getVideoTracks()[0]);
+      if(pixels>=bestPixels){
+        if(best) best.getTracks().forEach(t=>t.stop());
+        best=s; bestPixels=pixels; bestId=dev.deviceId;
+      }else s.getTracks().forEach(t=>t.stop());
+    }catch(e){}
+  }
+  if(!best) return openCamera(null);
+  if(bestId) localStorage.setItem(DEVICE_KEY,bestId);
+  return best;
+}
 
 async function startCamera(){
   if(!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
@@ -118,28 +214,113 @@ async function startCamera(){
     return;
   }
   try{
-    stream=await navigator.mediaDevices.getUserMedia({
-      video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}},
-      audio:false
-    });
+    status('Requesting the highest-resolution rear camera…');
+    await unlockCameraPermission();
+    await new Promise(r=>setTimeout(r,150));
+    const candidates=await listCandidateCameras();
+    if(candidates.length>1) status('Comparing rear cameras to pick the highest resolution…');
+    stream=await pickHighestResStream(candidates);
     video.srcObject=stream;
+    await video.play().catch(()=>{});
+    const settings=stream.getVideoTracks()[0].getSettings();
+    const label=stream.getVideoTracks()[0].label||'rear camera';
     $('start').disabled=true;$('stop').disabled=false;$('capture').disabled=false;
-    status('Point the camera at the whole page. Keep all four page edges visible and avoid glare.');
+    document.body.classList.add('live');
+    status((settings.width&&settings.height)
+      ? `${label}: ${settings.width}×${settings.height}. Align the page — edges are detected automatically.`
+      : 'Camera started. Align the page — edges are detected automatically.');
+    startDetectLoop();
   }catch(e){status('Camera error: '+e.message+'. Camera access requires HTTPS or localhost.')}
 }
 function stopCamera(){
+  stopDetectLoop();
   if(stream) stream.getTracks().forEach(t=>t.stop());
-  stream=null;video.srcObject=null;
+  stream=null;video.srcObject=null;liveCorners=null;
+  document.body.classList.remove('live');
   $('start').disabled=false;$('stop').disabled=true;$('capture').disabled=true;
   overlay.getContext('2d').clearRect(0,0,overlay.width,overlay.height);
 }
 $('start').onclick=startCamera;$('stop').onclick=stopCamera;
 
-function captureFrame(){
+function startDetectLoop(){
+  stopDetectLoop();
+  const tick=()=>{
+    runLiveDetect();
+    detectTimer=setTimeout(tick,180);
+  };
+  detectTimer=setTimeout(tick,60);
+}
+function stopDetectLoop(){
+  clearTimeout(detectTimer);
+  detectTimer=0;
+}
+
+function runLiveDetect(){
+  if(detectBusy||!cvReady||!stream||!video.videoWidth) return;
+  if($('detectMode').value!=='auto'){
+    liveCorners=null;
+    drawOverlay(null);
+    return;
+  }
+  detectBusy=true;
+  try{
+    const p=detectFromVideo();
+    liveCorners=p;
+    drawOverlay(p);
+  }catch(e){
+  }finally{
+    detectBusy=false;
+  }
+}
+
+function detectFromVideo(){
+  const maxW=480;
+  const scale=Math.min(1, maxW/video.videoWidth);
+  detectCanvas.width=Math.max(1,Math.round(video.videoWidth*scale));
+  detectCanvas.height=Math.max(1,Math.round(video.videoHeight*scale));
+  detectCanvas.getContext('2d',{willReadFrequently:true}).drawImage(video,0,0,detectCanvas.width,detectCanvas.height);
+  const mat=cv.imread(detectCanvas);
+  const p=detectPage(mat,false);
+  mat.delete();
+  if(!p) return null;
+  return p.map(pt=>({x:pt.x/scale,y:pt.y/scale}));
+}
+
+async function grabCaptureBitmap(){
+  const track=stream&&stream.getVideoTracks()[0];
+  if(track && 'ImageCapture' in window){
+    try{
+      const ic=new ImageCapture(track);
+      let opts;
+      try{
+        const caps=await ic.getPhotoCapabilities();
+        if(caps.imageWidth&&caps.imageWidth.max&&caps.imageHeight&&caps.imageHeight.max){
+          opts={imageWidth:caps.imageWidth.max,imageHeight:caps.imageHeight.max};
+        }
+      }catch(e){}
+      let blob;
+      try{blob=await ic.takePhoto(opts);}catch(e){blob=await ic.takePhoto();}
+      return await createImageBitmap(blob);
+    }catch(e){}
+  }
+  return await createImageBitmap(video);
+}
+
+async function captureFrame(){
   if(!video.videoWidth)return;
-  source.width=video.videoWidth;source.height=video.videoHeight;
-  source.getContext('2d').drawImage(video,0,0);
+  stopDetectLoop();
+  try{
+    const bmp=await grabCaptureBitmap();
+    source.width=bmp.width;source.height=bmp.height;
+    source.getContext('2d').drawImage(bmp,0,0);
+    if(bmp.close) bmp.close();
+  }catch(e){
+    source.width=video.videoWidth;source.height=video.videoHeight;
+    source.getContext('2d').drawImage(video,0,0);
+  }
   captured=source;
+  document.body.classList.remove('live');
+  $('scanCard').style.display='none';
   $('editCard').style.display='block';$('resultWrap').style.display='block';
   processPage();
 }
@@ -152,25 +333,79 @@ function orderPts(p){
   const tr=p[diff.indexOf(Math.max(...diff))], bl=p[diff.indexOf(Math.min(...diff))];
   return [tl,tr,br,bl];
 }
-function detectPage(mat){
-  let gray=new cv.Mat(), blur=new cv.Mat(), edges=new cv.Mat(), contours=new cv.MatVector(), hier=new cv.Mat();
+function polygonArea(pts){
+  let s=0;
+  for(let i=0;i<pts.length;i++){
+    const j=(i+1)%pts.length;
+    s+=pts[i].x*pts[j].y-pts[j].x*pts[i].y;
+  }
+  return Math.abs(s)/2;
+}
+function scoreQuad(pts,imageArea){
+  const area=polygonArea(pts);
+  if(area<imageArea*.08) return 0;
+  let anglePenalty=0;
+  for(let i=0;i<4;i++){
+    const a=pts[i], b=pts[(i+1)%4], c=pts[(i+2)%4];
+    const ux=a.x-b.x, uy=a.y-b.y, vx=c.x-b.x, vy=c.y-b.y;
+    const lu=Math.hypot(ux,uy), lv=Math.hypot(vx,vy);
+    if(lu<1||lv<1) return 0;
+    anglePenalty+=Math.abs((ux*vx+uy*vy)/(lu*lv));
+  }
+  if(anglePenalty>2.4) return 0;
+  return area*(1-anglePenalty/4);
+}
+function ptsFromApprox(approx){
+  const pts=[];
+  for(let j=0;j<4;j++){
+    const p=approx.intPtr(j,0);
+    pts.push({x:p[0],y:p[1]});
+  }
+  return orderPts(pts);
+}
+function bestQuadFromEdges(edges,imageArea){
+  const contours=new cv.MatVector(), hier=new cv.Mat();
+  cv.findContours(edges,contours,hier,cv.RETR_LIST,cv.CHAIN_APPROX_SIMPLE);
+  let best=null, bestScore=0;
+  for(let i=0;i<contours.size();i++){
+    const c=contours.get(i);
+    const hull=new cv.Mat();
+    cv.convexHull(c,hull);
+    const peri=cv.arcLength(hull,true);
+    for(const eps of [0.02,0.03,0.05]){
+      const approx=new cv.Mat();
+      cv.approxPolyDP(hull,approx,eps*peri,true);
+      if(approx.rows===4 && cv.isContourConvex(approx)){
+        const pts=ptsFromApprox(approx);
+        const sc=scoreQuad(pts,imageArea);
+        if(sc>bestScore){bestScore=sc;best=pts;}
+      }
+      approx.delete();
+    }
+    c.delete();hull.delete();
+  }
+  contours.delete();hier.delete();
+  return best;
+}
+function detectPage(mat,thorough){
+  const imageArea=mat.cols*mat.rows;
+  const gray=new cv.Mat(), blur=new cv.Mat(), edges=new cv.Mat();
   cv.cvtColor(mat,gray,cv.COLOR_RGBA2GRAY);
   cv.GaussianBlur(gray,blur,new cv.Size(5,5),0);
-  cv.Canny(blur,edges,60,180);
-  cv.findContours(edges,contours,hier,cv.RETR_LIST,cv.CHAIN_APPROX_SIMPLE);
-  let best=null,bestArea=0, imageArea=mat.cols*mat.rows;
-  for(let i=0;i<contours.size();i++){
-    let c=contours.get(i), peri=cv.arcLength(c,true), approx=new cv.Mat();
-    cv.approxPolyDP(c,approx,.025*peri,true);
-    let area=Math.abs(cv.contourArea(approx));
-    if(approx.rows===4 && area>imageArea*.18 && area>bestArea && cv.isContourConvex(approx)){
-      let pts=[];
-      for(let j=0;j<4;j++)pts.push({x:approx.intPtr(j,0)[0],y:approx.intPtr(j,0)[1]});
-      best=orderPts(pts);bestArea=area;
-    }
-    c.delete();approx.delete();
+  cv.Canny(blur,edges,50,160);
+  const ksize=thorough?5:3;
+  const kernel=cv.getStructuringElement(cv.MORPH_RECT,new cv.Size(ksize,ksize));
+  cv.dilate(edges,edges,kernel);
+  let best=bestQuadFromEdges(edges,imageArea);
+  if(!best && thorough){
+    const bin=new cv.Mat();
+    cv.adaptiveThreshold(blur,bin,255,cv.ADAPTIVE_THRESH_GAUSSIAN_C,cv.THRESH_BINARY,15,5);
+    cv.bitwise_not(bin,bin);
+    cv.dilate(bin,bin,kernel);
+    best=bestQuadFromEdges(bin,imageArea);
+    bin.delete();
   }
-  gray.delete();blur.delete();edges.delete();contours.delete();hier.delete();
+  kernel.delete();gray.delete();blur.delete();edges.delete();
   return best;
 }
 function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y)}
@@ -244,12 +479,33 @@ function matToCanvas(mat,canvas){
     canvas.width=tmp.width;canvas.height=tmp.height;canvas.getContext('2d').drawImage(tmp,0,0);
   }
 }
+function scaleLiveCorners(mat){
+  if(!liveCorners||!video.videoWidth) return null;
+  const sx=mat.cols/video.videoWidth, sy=mat.rows/video.videoHeight;
+  return liveCorners.map(pt=>({x:pt.x*sx,y:pt.y*sy}));
+}
+function detectOnCapture(mat){
+  const maxDetect=1200;
+  let detectMat=mat, ds=1;
+  if(mat.cols>maxDetect){
+    ds=maxDetect/mat.cols;
+    detectMat=new cv.Mat();
+    cv.resize(mat,detectMat,new cv.Size(Math.round(mat.cols*ds),Math.round(mat.rows*ds)),0,0,cv.INTER_AREA);
+  }
+  let p=detectPage(detectMat,true);
+  if(detectMat!==mat) detectMat.delete();
+  if(p && ds!==1) p=p.map(pt=>({x:pt.x/ds,y:pt.y/ds}));
+  return p;
+}
 function processPage(){
   if(!captured||!cvReady)return;
   editStatus('Detecting page and correcting perspective…');
   setTimeout(()=>{
     let mat=cv.imread(captured);
-    let p=detectPage(mat);
+    let p=null;
+    if($('detectMode').value==='auto'){
+      p=detectOnCapture(mat)||scaleLiveCorners(mat);
+    }
     if(!p){
       // Conservative fallback: use a 3% inset rectangle.
       p=[{x:mat.cols*.03,y:mat.rows*.03},{x:mat.cols*.97,y:mat.rows*.03},
@@ -261,22 +517,51 @@ function processPage(){
     matToCanvas(e,result);
     $('downloadJpeg').disabled=false;
     w.delete();e.delete();mat.delete();
-    drawOverlay(p);
   },20);
 }
+function videoLayout(){
+  const cam=video.parentElement.getBoundingClientRect();
+  const vW=video.videoWidth, vH=video.videoHeight;
+  if(!vW||!cam.width) return null;
+  const scale=Math.min(cam.width/vW, cam.height/vH);
+  return {
+    offX:(cam.width-vW*scale)/2,
+    offY:(cam.height-vH*scale)/2,
+    scale,
+    boxW:cam.width,
+    boxH:cam.height
+  };
+}
 function drawOverlay(p){
-  const r=video.getBoundingClientRect(), vW=video.videoWidth, vH=video.videoHeight;
-  overlay.width=r.width*devicePixelRatio;overlay.height=r.height*devicePixelRatio;
-  overlay.style.width=r.width+'px';overlay.style.height=r.height+'px';
-  const c=overlay.getContext('2d');c.scale(devicePixelRatio,devicePixelRatio);c.clearRect(0,0,r.width,r.height);
+  const layout=videoLayout();
+  if(!layout) return;
+  overlay.width=layout.boxW*devicePixelRatio;overlay.height=layout.boxH*devicePixelRatio;
+  overlay.style.width=layout.boxW+'px';overlay.style.height=layout.boxH+'px';
+  const c=overlay.getContext('2d');
+  c.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+  c.clearRect(0,0,layout.boxW,layout.boxH);
   if(!p)return;
-  const sx=r.width/vW, sy=r.height/vH;
-  c.beginPath();p.forEach((q,i)=>i?c.lineTo(q.x*sx,q.y*sy):c.moveTo(q.x*sx,q.y*sy));c.closePath();
+  c.beginPath();
+  p.forEach((q,i)=>{
+    const x=q.x*layout.scale+layout.offX, y=q.y*layout.scale+layout.offY;
+    i?c.lineTo(x,y):c.moveTo(x,y);
+  });
+  c.closePath();
+  c.fillStyle='rgba(0,255,157,.16)';
+  c.fill();
   c.lineWidth=3;c.strokeStyle='#00ff9d';c.stroke();
 }
 $('process').onclick=processPage;
 ['enhance','contrast','brightness','sharpness'].forEach(id=>$(id).addEventListener('input',()=>{if(captured)processPage()}));
-$('retake').onclick=()=>{$('editCard').style.display='none';$('resultWrap').style.display='none';captured=null;$('downloadJpeg').disabled=true;status('Ready for another capture.');};
+$('retake').onclick=()=>{
+  $('editCard').style.display='none';$('resultWrap').style.display='none';
+  $('scanCard').style.display='';captured=null;$('downloadJpeg').disabled=true;
+  if(stream){
+    document.body.classList.add('live');
+    startDetectLoop();
+    status('Ready for another capture.');
+  }else status('Start the camera to capture another page.');
+};
 
 function addCurrentPage(){
   if(!result.width)return;
@@ -327,7 +612,7 @@ async function savePDF(){
   pdf.save('scanned-document.pdf');
 }
 $('downloadPdf').onclick=savePDF;
-window.addEventListener('resize',()=>{if(corners&&video.videoWidth)drawOverlay(corners)});
+window.addEventListener('resize',()=>{if(video.videoWidth)drawOverlay(liveCorners||corners)});
 </script>
 
 <script>
