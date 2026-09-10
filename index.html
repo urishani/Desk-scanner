@@ -13,7 +13,7 @@
   *{box-sizing:border-box}
   html,body{height:100%;margin:0}
   body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#111;color:#eee;display:flex;flex-direction:column;height:100dvh;overflow:hidden}
-  header{padding:8px 12px;padding-top:max(8px,env(safe-area-inset-top));background:#1b1b1b;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-shrink:0}
+  header{padding:8px 12px;padding-top:max(8px,env(safe-area-inset-top));background:#1b1b1b;display:flex;align-items:center;gap:10px;flex-shrink:0}
   .brand{display:flex;align-items:baseline;gap:8px;min-width:0}
   h1{font-size:17px;margin:0;font-weight:650}
   .ver{font-size:11px;color:#9adbc4;background:#0d3d30;border-radius:999px;padding:2px 8px;font-weight:650;letter-spacing:.02em;flex-shrink:0}
@@ -53,17 +53,15 @@
   .page-actions{display:flex;gap:6px}
   .page-actions button{padding:8px 10px}
   .empty{color:#888;padding:24px 8px;text-align:center}
+  #closeToast{position:fixed;left:50%;top:42%;transform:translate(-50%,-50%);display:none;z-index:80;background:#1c1c1c;color:#fff;padding:16px 20px;border-radius:14px;border:1px solid #4a4a4a;max-width:86%;text-align:center;font-size:16px;line-height:1.45}
+  #closeToast.show{display:block}
 </style>
 </head>
 <body>
 <header>
   <div class="brand">
     <h1>Desk Scanner</h1>
-    <span id="appVersion" class="ver"><!--APP_VERSION-->v1<!--/APP_VERSION--></span>
-  </div>
-  <div class="row">
-    <button id="start" class="primary">Start camera</button>
-    <button id="stop" class="ghost" disabled>Stop</button>
+    <span id="appVersion" class="ver"><!--APP_VERSION-->v2<!--/APP_VERSION--></span>
   </div>
 </header>
 
@@ -78,7 +76,7 @@
 </div>
 
 <div class="bar">
-  <div id="status" class="status">Press Start camera. Document mode whitens the page and sharpens text. Picture mode keeps a vivid photo.</div>
+  <div id="status" class="status">Opening camera… Document mode whitens the page and sharpens text. Picture mode keeps a vivid photo.</div>
   <div id="liveBar">
     <div class="capture-row">
       <button id="captureDoc" class="primary" disabled>Document</button>
@@ -111,6 +109,8 @@
   <div class="sheet-list" id="sheetList"></div>
 </div>
 
+<div id="closeToast">Do you want to close? Click again.</div>
+
 <canvas id="sourceCanvas" class="hidden"></canvas>
 <canvas id="detectCanvas" class="hidden"></canvas>
 
@@ -131,7 +131,7 @@ function waitForCV(){
   if(typeof cv!=='undefined' && cv.Mat){
     cvReady=true;
     if(stream && !reviewing) startDetectLoop();
-    else if(!stream) status('OpenCV is ready. Start the camera when you are ready.');
+    else if(!stream) status('Opening camera…');
   } else setTimeout(waitForCV,150);
 }
 waitForCV();
@@ -238,23 +238,20 @@ async function startCamera(){
     await video.play().catch(()=>{});
     const settings=stream.getVideoTracks()[0].getSettings();
     const label=stream.getVideoTracks()[0].label||'rear camera';
-    $('start').disabled=true;$('stop').disabled=false;
     setCaptureEnabled(true);
     status((settings.width&&settings.height)
       ? `${label}: ${settings.width}×${settings.height}. Document or Picture — the page outline appears automatically.`
       : 'Camera started. Capture as Document or Picture.');
     if(!reviewing) startDetectLoop();
-  }catch(e){status('Camera error: '+e.message+'. Camera access requires HTTPS or localhost.')}
+  }catch(e){status('Camera error: '+e.message+'. Tap the screen to retry. Camera access requires HTTPS or localhost.')}
 }
 function stopCamera(){
   stopDetectLoop();
   if(stream) stream.getTracks().forEach(t=>t.stop());
   stream=null;video.srcObject=null;liveCorners=null;
-  $('start').disabled=false;$('stop').disabled=true;
   setCaptureEnabled(false);
   overlay.getContext('2d').clearRect(0,0,overlay.width,overlay.height);
 }
-$('start').onclick=startCamera;$('stop').onclick=stopCamera;
 
 function startDetectLoop(){
   stopDetectLoop();
@@ -450,15 +447,69 @@ function warp(mat,p){
   const src=cv.matFromArray(4,1,cv.CV_32FC2,[tl.x,tl.y,tr.x,tr.y,br.x,br.y,bl.x,bl.y]);
   const dst=cv.matFromArray(4,1,cv.CV_32FC2,[0,0,W-1,0,W-1,H-1,0,H-1]);
   const M=cv.getPerspectiveTransform(src,dst), out=new cv.Mat();
-  cv.warpPerspective(mat,out,M,new cv.Size(W,H),cv.INTER_CUBIC,cv.BORDER_REPLICATE);
+  cv.warpPerspective(mat,out,M,new cv.Size(W,H),(typeof cv.INTER_LANCZOS4==='number'?cv.INTER_LANCZOS4:cv.INTER_CUBIC),cv.BORDER_REPLICATE);
   src.delete();dst.delete();M.delete();
   return out;
 }
 
-function constMat(rows,cols,type,value){
-  const m=new cv.Mat(rows,cols,type);
-  m.setTo(new cv.Scalar(value));
-  return m;
+function histPercentile(gray,p){
+  const maxSide=360;
+  let src=gray, small=null;
+  if(Math.max(gray.cols,gray.rows)>maxSide){
+    const s=maxSide/Math.max(gray.cols,gray.rows);
+    small=new cv.Mat();
+    cv.resize(gray,small,new cv.Size(Math.max(1,Math.round(gray.cols*s)),Math.max(1,Math.round(gray.rows*s))),0,0,cv.INTER_AREA);
+    src=small;
+  }
+  try{
+    const vec=new cv.MatVector();
+    vec.push_back(src);
+    const hist=new cv.Mat(), mask=new cv.Mat();
+    cv.calcHist(vec,[0],mask,hist,[256],[0,256],false);
+    const want=src.rows*src.cols*p;
+    let acc=0, bin=255;
+    const data=hist.data32F;
+    for(let i=0;i<256;i++){
+      acc+=data[i];
+      if(acc>=want){bin=i;break;}
+    }
+    vec.delete();hist.delete();mask.delete();
+    if(small) small.delete();
+    return bin;
+  }catch(e){
+    const mean=cv.mean(src)[0];
+    if(small) small.delete();
+    return Math.max(0,Math.min(255,Math.round(mean)));
+  }
+}
+
+function estimateBackground(L){
+  const maxSide=480;
+  const s=Math.min(1,maxSide/Math.max(L.cols,L.rows));
+  const small=new cv.Mat();
+  cv.resize(L,small,new cv.Size(Math.max(8,Math.round(L.cols*s)),Math.max(8,Math.round(L.rows*s))),0,0,cv.INTER_AREA);
+  const k=Math.max(9,(Math.round(Math.min(small.cols,small.rows)/9)|1));
+  const kernel=cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(k,k));
+  const closed=new cv.Mat();
+  cv.morphologyEx(small,closed,cv.MORPH_CLOSE,kernel);
+  cv.GaussianBlur(closed,closed,new cv.Size(5,5),0);
+  const bg=new cv.Mat();
+  cv.resize(closed,bg,new cv.Size(L.cols,L.rows),0,0,cv.INTER_LINEAR);
+  small.delete();closed.delete();kernel.delete();
+  return bg;
+}
+
+function makeWhiteLut(t0,t1){
+  const lut=new cv.Mat(1,256,cv.CV_8UC1);
+  const d=lut.data;
+  const span=Math.max(1,t1-t0);
+  for(let i=0;i<256;i++){
+    let m=(i-t0)/span;
+    if(m<0)m=0; if(m>1)m=1;
+    m=m*m*(3-2*m);
+    d[i]=Math.round(i+m*(255-i));
+  }
+  return lut;
 }
 
 function enhanceDocument(src){
@@ -471,61 +522,67 @@ function enhanceDocument(src){
   cv.split(lab,planes);
   const L=planes.get(0), A=planes.get(1), Bch=planes.get(2);
 
-  const k=Math.max(31,(Math.round(Math.min(src.cols,src.rows)/16)|1));
-  const blur=new cv.Mat();
-  cv.GaussianBlur(L,blur,new cv.Size(k,k),0);
-
+  const bg=estimateBackground(L);
   const Lf=new cv.Mat(), bf=new cv.Mat();
   L.convertTo(Lf,cv.CV_32F);
-  blur.convertTo(bf,cv.CV_32F);
-  const eps=constMat(bf.rows,bf.cols,cv.CV_32FC1,12);
-  cv.add(bf,eps,bf);
+  bg.convertTo(bf,cv.CV_32F,1,8);
   cv.divide(Lf,bf,Lf);
-  const scale=constMat(Lf.rows,Lf.cols,cv.CV_32FC1,220);
-  cv.multiply(Lf,scale,Lf);
   const Lflat=new cv.Mat();
-  Lf.convertTo(Lflat,cv.CV_8U);
+  Lf.convertTo(Lflat,cv.CV_8U,245,0);
 
-  const clahe=new cv.CLAHE(3.0,new cv.Size(8,8));
+  const lo=histPercentile(Lflat,0.02);
+  const hi=Math.max(lo+8,histPercentile(Lflat,0.98));
+  const alpha=235/Math.max(1,hi-lo);
+  const beta=-lo*alpha+12;
+  Lflat.convertTo(Lflat,-1,alpha,beta);
+
+  const clahe=new cv.CLAHE(1.6,new cv.Size(8,8));
   const Leq=new cv.Mat();
   clahe.apply(Lflat,Leq);
   clahe.delete();
-  Leq.convertTo(Leq,-1,1.48,12);
 
-  const paper=new cv.Mat();
-  cv.threshold(Leq,paper,212,255,cv.THRESH_BINARY);
-  Leq.setTo(new cv.Scalar(255),paper);
-  A.setTo(new cv.Scalar(128),paper);
-  Bch.setTo(new cv.Scalar(128),paper);
-  A.convertTo(A,-1,1.2,-25.6);
-  Bch.convertTo(Bch,-1,1.2,-25.6);
+  const paper=Math.max(200,histPercentile(Leq,0.90));
+  const t0=Math.max(168,Math.round(paper*0.84));
+  const t1=Math.min(252,paper+4);
+  const lut=makeWhiteLut(t0,t1);
+  const Lout=new cv.Mat();
+  cv.LUT(Leq,lut,Lout);
+
+  const paperMask=new cv.Mat();
+  cv.threshold(Lout,paperMask,Math.round((t0+t1)/2),255,cv.THRESH_BINARY);
+  A.setTo(new cv.Scalar(128),paperMask);
+  Bch.setTo(new cv.Scalar(128),paperMask);
+
+  const Lsharp=new cv.Mat(), Lblur=new cv.Mat();
+  cv.GaussianBlur(Lout,Lblur,new cv.Size(0,0),0.7);
+  cv.addWeighted(Lout,1.75,Lblur,-0.75,0,Lsharp);
 
   const merged=new cv.Mat(), outPlanes=new cv.MatVector();
-  outPlanes.push_back(Leq);outPlanes.push_back(A);outPlanes.push_back(Bch);
+  outPlanes.push_back(Lsharp);outPlanes.push_back(A);outPlanes.push_back(Bch);
   cv.merge(outPlanes,merged);
   const color=new cv.Mat();
   cv.cvtColor(merged,color,cv.COLOR_Lab2RGB);
-
-  const g=new cv.Mat(), sharp=new cv.Mat();
-  cv.GaussianBlur(color,g,new cv.Size(0,0),0.9);
-  cv.addWeighted(color,2.15,g,-1.15,0,sharp);
   const rgba=new cv.Mat();
-  cv.cvtColor(sharp,rgba,cv.COLOR_RGB2RGBA);
+  cv.cvtColor(color,rgba,cv.COLOR_RGB2RGBA);
 
   rgb.delete();lab.delete();planes.delete();L.delete();A.delete();Bch.delete();
-  blur.delete();Lf.delete();bf.delete();eps.delete();scale.delete();Lflat.delete();
-  Leq.delete();paper.delete();merged.delete();outPlanes.delete();color.delete();g.delete();sharp.delete();
+  bg.delete();Lf.delete();bf.delete();Lflat.delete();Leq.delete();lut.delete();
+  Lout.delete();paperMask.delete();Lsharp.delete();Lblur.delete();
+  merged.delete();outPlanes.delete();color.delete();
   return rgba;
 }
 
 function enhancePicture(src){
-  let out=src.clone();
-  out.convertTo(out,-1,1.12,6);
+  const rgb=new cv.Mat();
+  cv.cvtColor(src,rgb,src.channels()===4?cv.COLOR_RGBA2RGB:cv.COLOR_GRAY2RGB);
+  rgb.convertTo(rgb,-1,1.08,4);
   const blur=new cv.Mat(), sharp=new cv.Mat();
-  cv.GaussianBlur(out,blur,new cv.Size(0,0),1.0);
-  cv.addWeighted(out,1.55,blur,-0.55,0,sharp);
-  out.delete();blur.delete();
-  return sharp;
+  cv.GaussianBlur(rgb,blur,new cv.Size(0,0),0.85);
+  cv.addWeighted(rgb,1.42,blur,-0.42,0,sharp);
+  const rgba=new cv.Mat();
+  cv.cvtColor(sharp,rgba,cv.COLOR_RGB2RGBA);
+  rgb.delete();blur.delete();sharp.delete();
+  return rgba;
 }
 
 function matToCanvas(mat,canvas){
@@ -575,7 +632,7 @@ function processPage(){
     }
     corners=p;
     let w=p?warp(mat,p):mat.clone();
-    const maxSide=2400;
+    const maxSide=captureMode==='document'?3600:3200;
     const long=Math.max(w.cols,w.rows);
     if(long>maxSide){
       const s=maxSide/long;
@@ -586,7 +643,7 @@ function processPage(){
     matToCanvas(w,original);
     const e=captureMode==='document'?enhanceDocument(w):enhancePicture(w);
     matToCanvas(e,processed);
-    currentJpeg=processed.toDataURL('image/jpeg',.94);
+    currentJpeg=processed.toDataURL('image/jpeg',.97);
     showingOriginal=false;
     $('review').classList.remove('show-original');
     $('reviewHint').textContent='Processed · tap to see original';
@@ -643,7 +700,7 @@ $('review').onclick=()=>{
 
 $('retake').onclick=()=>{
   leaveReview();
-  status(stream?'Ready for another capture.':'Start the camera to capture another page.');
+  status(stream?'Ready for another capture.':'Opening camera…');
 };
 
 function pendingExportList(){
@@ -683,7 +740,7 @@ $('addPage').onclick=addCurrentPage;
 function saveJPEG(){
   if(!processed.width)return;
   const a=document.createElement('a');
-  a.href=processed.toDataURL('image/jpeg',0.95);
+  a.href=processed.toDataURL('image/jpeg',0.97);
   a.download=(captureMode==='document'?'scanned-document-':'scanned-photo-')+new Date().toISOString().replace(/[:.]/g,'-')+'.jpg';
   document.body.appendChild(a); a.click(); a.remove();
 }
@@ -702,7 +759,7 @@ async function savePDF(){
     const pw=pdf.internal.pageSize.getWidth(), ph=pdf.internal.pageSize.getHeight(), margin=5;
     const scale=Math.min((pw-2*margin)/im.width,(ph-2*margin)/im.height);
     const w=im.width*scale,h=im.height*scale;
-    pdf.addImage(im,'JPEG',(pw-w)/2,(ph-h)/2,w,h,'','FAST');
+    pdf.addImage(im,'JPEG',(pw-w)/2,(ph-h)/2,w,h,'','MEDIUM');
   }
   pdf.save('scanned-document.pdf');
   status('Saved PDF ('+list.length+' page'+(list.length>1?'s':'')+').');
@@ -765,6 +822,57 @@ $('closeSheet').onclick=closePdfSheet;
 
 updatePdfUi();
 window.addEventListener('resize',()=>{if(video.videoWidth && !reviewing)drawOverlay(liveCorners||corners)});
+
+$('stage').addEventListener('click',()=>{
+  if(!stream && !reviewing) startCamera();
+});
+
+startCamera();
+
+let closeArmed=false, closeTimer=0, leavingApp=false;
+function stayOnApp(){
+  if(!leavingApp) history.pushState({desk:1},'',location.href);
+}
+function hideClosePrompt(){
+  closeArmed=false;
+  clearTimeout(closeTimer);
+  $('closeToast').classList.remove('show');
+}
+function showClosePrompt(){
+  closeArmed=true;
+  $('closeToast').classList.add('show');
+  status('Do you want to close? Click again.');
+  clearTimeout(closeTimer);
+  closeTimer=setTimeout(hideClosePrompt,2500);
+}
+stayOnApp();
+window.addEventListener('popstate',()=>{
+  if(leavingApp) return;
+  if($('pdfSheet').classList.contains('open')){
+    closePdfSheet();
+    hideClosePrompt();
+    stayOnApp();
+    return;
+  }
+  if(closeArmed){
+    leavingApp=true;
+    hideClosePrompt();
+    history.back();
+    return;
+  }
+  showClosePrompt();
+  stayOnApp();
+});
+$('closeToast').onclick=e=>{
+  e.stopPropagation();
+  if(!closeArmed) return;
+  leavingApp=true;
+  hideClosePrompt();
+  history.go(-2);
+};
+window.addEventListener('pagehide',()=>{
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+});
 </script>
 
 <script>
